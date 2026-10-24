@@ -1,0 +1,87 @@
+[
+  {
+    "path": "src/abseil-cpp",
+    "url": "https://android.googlesource.com/platform/external/abseil-cpp"
+  },
+  {
+    "path": "src/base",
+    "url": "https://android.googlesource.com/platform/frameworks/base"
+  },
+  {
+    "path": "src/boringssl",
+    "url": "https://android.googlesource.com/platform/external/boringssl"
+  },
+  {
+    "path": "src/build",
+    "url": "https://android.googlesource.com/platform/build"
+  },
+  {
+    "path": "src/core",
+    "url": "https://android.googlesource.com/platform/system/core"
+  },
+  {
+    "path": "src/expat",
+    "url": "https://android.googlesource.com/platform/external/expat"
+  },
+  {
+    "path": "src/fmtlib",
+    "url": "https://android.googlesource.com/platform/external/fmtlib"
+  },
+  {
+    "path": "src/googletest",
+    "url": "https://android.googlesource.com/platform/external/googletest"
+  },
+  {
+    "path": "src/incremental_delivery",
+    "url": "https://android.googlesource.com/platform/system/incremental_delivery"
+  },
+  {
+    "path": "src/libbase",
+    "url": "https://android.googlesource.com/platform/system/libbase"
+  },
+  {
+    "path": "src/libpng",
+    "url": "https://android.googlesource.com/platform/external/libpng"
+  },
+  {
+    "path": "src/libziparchive",
+    "url": "https://android.googlesource.com/platform/system/libziparchive"
+  },
+  {
+    "path": "src/logging",
+    "url": "https://android.googlesource.com/platform/system/logging"
+  },
+  {
+    "path": "src/native",
+    "url": "https://android.googlesource.com/platform/frameworks/native"
+  },
+  {
+    "path": "src/pcre",
+    "url": "https://android.googlesource.com/platform/external/pcre"
+  },
+  {
+    "path": "src/protobuf",
+    "url": "https://android.googlesource.com/platform/external/protobuf"
+  },
+  {
+    "path": "src/selinux",
+    "url": "https://android.googlesource.com/platform/external/selinux"
+  },
+  {
+    "path": "src/soong",
+    "url": "https://android.googlesource.com/platform/build/soong"
+  },
+  {
+    "path": "src/unwinding",
+    "url": "https://android.googlesource.com/platform/system/unwinding"
+  },
+  {
+    "path": "src/zlib",
+    "url": "https://github.com/madler/zlib",
+    "branch": "v1.3.1"
+  },
+  {
+    "path": "src/zopfli",
+    "url": "https://android.googlesource.com/platform/external/zopfli"
+  }
+]
