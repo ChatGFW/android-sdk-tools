@@ -1,0 +1,724 @@
+name: build-tools-static
+
+# Build only aapt2 + zipalign as fully static AArch64 Linux executables.
+#
+#   build-tools version -> discovered from the official SDK metadata (stable 37.x only)
+#   AOSP source tag     -> proven by Build.java's highest VERSION_CODES == build tools major
+#   cache               -> sources + host protoc, guarded by a SHA-256 manifest
+#   release             -> only when build *and* verification succeeded
+#
+# Schedule: 0 22 * * * UTC == 06:00 Asia/Shanghai (daily)
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_tools_version:
+        description: 'Exact stable build-tools version, empty = newest stable'
+        required: false
+        default: ''
+      force_rebuild:
+        description: 'Ignore the source cache and overwrite an existing release of the same version'
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 22 * * *'
+  push:
+    branches: [master, main]
+    paths:
+      - 'build-tools/**'
+      - 'lib/**'
+      - 'cmake/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - 'build.py'
+      - 'get_source.py'
+      - 'repository.json'
+      - 'CMakeLists.txt'
+      - '.github/workflows/build-tools-static.yml'
+
+# least privilege by default, the release job opts into contents: write
+permissions:
+  contents: read
+
+concurrency:
+  group: build-tools-static-${{ inputs.build_tools_version || 'auto' }}
+  cancel-in-progress: false
+
+env:
+  TARGET_ARCH: aarch64
+  TOOLS: aapt2 zipalign
+  CACHE_VERSION: v1
+
+jobs:
+  # ------------------------------------------------------------------ resolve
+  resolve:
+    name: Resolve build-tools version and AOSP tag
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    outputs:
+      build_tools_version: ${{ steps.resolve.outputs.BUILD_TOOLS_VERSION }}
+      aosp_tag: ${{ steps.resolve.outputs.AOSP_TAG }}
+      api_level: ${{ steps.resolve.outputs.AOSP_API_LEVEL }}
+      source_key: ${{ steps.resolve.outputs.SOURCE_KEY }}
+      cache_key: ${{ steps.key.outputs.cache_key }}
+    steps:
+      - name: Assert native AArch64 runner
+        run: |
+          arch="$(uname -m)"
+          echo "runner: $(uname -srm)"
+          if [ "$arch" != "aarch64" ] && [ "$arch" != "arm64" ]; then
+            echo "::error::this job must run on a native ARM64 runner, got $arch"
+            echo "This project builds natively for AArch64 and has no cross toolchain."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        name: Check out the repository
+
+      - name: Resolve newest stable build-tools version
+        id: resolve
+        env:
+          REQUESTED: ${{ inputs.build_tools_version }}
+        run: |
+          python3 --version
+          python3 scripts/resolve_build_tools.py \
+            --requested "$REQUESTED" \
+            --json resolved.json \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Compute source cache key
+        id: key
+        env:
+          FORCE: ${{ inputs.force_rebuild }}
+        run: |
+          base="cache-src-${CACHE_VERSION}-$(uname -s)-$(uname -m)-bt${{ steps.resolve.outputs.BUILD_TOOLS_VERSION }}-${{ steps.resolve.outputs.AOSP_TAG }}-${{ hashFiles('patches/**', 'scripts/**', 'get_source.py', 'repository.json') }}"
+          if [ "$FORCE" = "true" ]; then
+            # force_rebuild must not be served by the cache, and must not poison it
+            base="${base}-force-${{ github.run_id }}"
+          fi
+          echo "cache_key=$base" >> "$GITHUB_OUTPUT"
+          echo "cache key: $base"
+
+      - name: Summary
+        run: |
+          {
+            echo "### resolved"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| build-tools | \`${{ steps.resolve.outputs.BUILD_TOOLS_VERSION }}\` |"
+            echo "| AOSP tag | \`${{ steps.resolve.outputs.AOSP_TAG }}\` |"
+            echo "| API level | ${{ steps.resolve.outputs.AOSP_API_LEVEL }} |"
+            echo "| cache key | \`${{ steps.key.outputs.cache_key }}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        name: Upload resolved metadata
+        with:
+          name: resolved
+          path: resolved.json
+          retention-days: 7
+
+  # ------------------------------------------------------------------- detect
+  # Cheap gate: nothing is rebuilt unless an input actually changed.  The AOSP
+  # sources sit behind an immutable release tag, so what can really change is the
+  # resolved build-tools version, the resolved clang/cmake versions, and this
+  # repository's own build inputs.
+  detect:
+    name: Detect input changes (build gate)
+    needs: resolve
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 10
+    outputs:
+      should_build: ${{ steps.fp.outputs.should_build }}
+      fingerprint: ${{ steps.fp.outputs.fingerprint }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        name: Check out the repository
+
+      - name: Resolve clang version (apt.llvm.org, no install)
+        id: clang
+        run: |
+          python3 scripts/resolve_clang_version.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Resolve cmake version (Kitware, no download)
+        id: cmake
+        run: |
+          python3 scripts/resolve_cmake_version.py --check-only --github-output "$GITHUB_OUTPUT"
+
+      - name: Fetch published BUILD-INFO.txt
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: build-tools-${{ needs.resolve.outputs.build_tools_version }}-aarch64-linux-static
+        run: |
+          mkdir -p prev
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release download "$TAG" --pattern BUILD-INFO.txt --dir prev --clobber \
+              || echo "::notice::could not download BUILD-INFO.txt from $TAG"
+          else
+            echo "::notice::release $TAG does not exist yet, so this will be the first build"
+          fi
+          ls -l prev
+
+      - name: Decide whether a rebuild is needed
+        id: fp
+        env:
+          BT_VERSION: ${{ needs.resolve.outputs.build_tools_version }}
+          AOSP_TAG: ${{ needs.resolve.outputs.aosp_tag }}
+          API_LEVEL: ${{ needs.resolve.outputs.api_level }}
+          CLANG_VERSION: ${{ steps.clang.outputs.clang_version }}
+          CMAKE_VERSION: ${{ steps.cmake.outputs.cmake_version }}
+          FORCE: ${{ inputs.force_rebuild }}
+        run: |
+          set -eu
+          force_arg=''
+          if [ "${FORCE}" = 'true' ]; then force_arg='--force'; fi
+          python3 scripts/build_fingerprint.py \
+            --build-tools "${BT_VERSION}" \
+            --aosp-tag "${AOSP_TAG}" \
+            --api-level "${API_LEVEL}" \
+            --clang "${CLANG_VERSION}" \
+            --cmake "${CMAKE_VERSION}" \
+            --inputs "${{ hashFiles('patches/**','scripts/**','build.py','get_source.py','repository.json','CMakeLists.txt','cmake/**','build-tools/**','lib/**','.github/workflows/build-tools-static.yml') }}" \
+            --previous prev/BUILD-INFO.txt \
+            ${force_arg} \
+            --github-output "$GITHUB_OUTPUT"
+
+      - name: Summary
+        env:
+          SHOULD: ${{ steps.fp.outputs.should_build }}
+          FP: ${{ steps.fp.outputs.fingerprint }}
+          PREV: ${{ steps.fp.outputs.previous }}
+          REASON: ${{ steps.fp.outputs.reason }}
+          CLANG_VERSION: ${{ steps.clang.outputs.clang_version }}
+          CMAKE_VERSION: ${{ steps.cmake.outputs.cmake_version }}
+        run: |
+          {
+            echo "### detect"
+            echo ""
+            echo "| item | value |"
+            echo "| --- | --- |"
+            echo "| clang | \`${CLANG_VERSION}\` |"
+            echo "| cmake | \`${CMAKE_VERSION}\` |"
+            echo "| fingerprint | \`${FP}\` |"
+            echo "| previous | \`${PREV:-none}\` |"
+            echo "| decision | **${SHOULD}** - ${REASON} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "${SHOULD}" != "true" ]; then
+            echo "::notice::every input still matches the published build, so the build is skipped"
+          fi
+
+
+  # -------------------------------------------------------------------- build
+  build:
+    name: Build aapt2 + zipalign (static, linux/arm64)
+    needs: [resolve, detect]
+    if: needs.detect.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        name: Check out the repository
+
+      - name: Resolve clang version (apt.llvm.org)
+        id: clang
+        run: |
+          python3 scripts/resolve_clang_version.py --github-output "$GITHUB_OUTPUT"
+
+      - name: Install build dependencies
+        env:
+          CLANG_MAJOR: ${{ steps.clang.outputs.clang_major }}
+        run: |
+          set -eu
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison flex golang-go patch ninja-build g++ zlib1g-dev \
+            ca-certificates curl gnupg
+          ninja --version
+
+      - name: Add apt.llvm.org repo and install clang
+        env:
+          CLANG_MAJOR: ${{ steps.clang.outputs.clang_major }}
+          CLANG_VERSION: ${{ steps.clang.outputs.clang_version }}
+          LLVM_KEY_FPR: 6084F3CF814B57C1CF12EFD515CF4D18AF4F7421
+        run: |
+          set -eu
+          # llvm.sh would work, but it defaults to an older major and is fetched
+          # and executed unverified. Pin the signing key by fingerprint instead so
+          # the repository cannot be swapped underneath the build.
+          key="$RUNNER_TEMP/llvm-snapshot.gpg.key"
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key -o "$key"
+          fingerprint="$(gpg --show-keys --with-colons "$key" \
+            | awk -F: '/^fpr:/ {print $10; exit}')"
+          if [ "$fingerprint" != "${LLVM_KEY_FPR}" ]; then
+            echo "::error::unexpected apt.llvm.org signing key: $fingerprint"
+            exit 1
+          fi
+          # the download is an ASCII armored key; apt needs a dearmored keyring
+          # behind signed-by, otherwise apt cannot find the key and the repo is
+          # rejected with NO_PUBKEY
+          sudo gpg --batch --yes --dearmor \
+            -o /usr/share/keyrings/apt-llvm.gpg < "$key"
+          sudo chmod 0644 /usr/share/keyrings/apt-llvm.gpg
+          gpg --show-keys --with-colons /usr/share/keyrings/apt-llvm.gpg \
+            | awk -F: '/^fpr:/ {print "keyring fingerprint: " $10; exit}'
+          codename="$(. /etc/os-release && echo "$VERSION_CODENAME")"
+          echo "deb [arch=amd64,arm64 signed-by=/usr/share/keyrings/apt-llvm.gpg] https://apt.llvm.org/${codename}/ llvm-toolchain-${codename}-${CLANG_MAJOR} main" \
+            | sudo tee /etc/apt/sources.list.d/apt-llvm.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends "clang-${CLANG_MAJOR}"
+          # the versioned driver names carry the suffix, e.g. clang++-23 (not
+          # clang-23++); fail here rather than deep inside the configure step
+          for driver in "clang-${CLANG_MAJOR}" "clang++-${CLANG_MAJOR}"; do
+            command -v "$driver" >/dev/null \
+              || { echo "::error::missing compiler driver: $driver"; exit 1; }
+          done
+          # the installed package must be the version the resolver picked
+          installed="$("clang-${CLANG_MAJOR}" --version | head -1)"
+          echo "$installed"
+          echo "c++ driver: $(command -v "clang++-${CLANG_MAJOR}")"
+          case "$installed" in
+            *"clang version ${CLANG_VERSION}"*) ;;
+            *) echo "::error::expected clang ${CLANG_VERSION}, got: $installed"; exit 1 ;;
+          esac
+
+      - name: Install cmake from Kitware
+        id: cmake
+        run: |
+          python3 scripts/resolve_cmake_version.py \
+            --dest "$RUNNER_TEMP/cmake" --github-output "$GITHUB_OUTPUT"
+
+      - name: Prepend cmake to PATH
+        run: |
+          echo "${{ steps.cmake.outputs.cmake_bin }}" >> "$GITHUB_PATH"
+
+      - name: Confirm toolchain versions
+        env:
+          CLANG_MAJOR: ${{ steps.clang.outputs.clang_major }}
+        run: |
+          cmake --version | head -1
+          "clang-${CLANG_MAJOR}" --version | head -1
+          ninja --version
+
+      - name: Compute protoc cache key
+        id: protoc_key
+        run: |
+          # protoc depends on the compiler and the protobuf sources only, never on
+          # the patches or the build scripts, so editing those must not throw it
+          # away and pay for a rebuild.
+          echo "key=cache-protoc-${CACHE_VERSION}-$(uname -s)-$(uname -m)-clang${{ steps.clang.outputs.clang_major }}-${{ needs.resolve.outputs.aosp_tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Restore protoc cache
+        id: protoc_cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.protoc_key.outputs.key }}
+          path: host-tools
+
+      - name: Validate restored protoc
+        if: steps.protoc_cache.outputs.cache-hit == 'true'
+        run: |
+          if [ -x host-tools/protoc ] && host-tools/protoc --version > /dev/null 2>&1; then
+            echo "reusing protoc: $(host-tools/protoc --version)"
+          else
+            echo "::warning::the cached protoc cannot run, building it again"
+            rm -rf host-tools
+          fi
+
+      - name: Restore source cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ needs.resolve.outputs.cache_key }}
+          path: |
+            src
+            cache-meta
+
+      - name: Verify restored cache against SHA-256 manifest
+        id: verify
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: |
+          status=invalid
+          if python3 scripts/cache_manifest.py verify --root src --manifest cache-meta/src.sha256; then
+            status=ok
+          fi
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          if [ "$status" != "ok" ]; then
+            echo "::warning::cache did not match its manifest, discarding it and rebuilding from scratch"
+            rm -rf src cache-meta
+          fi
+
+      - name: Fetch AOSP sources
+        if: steps.verify.outputs.status != 'ok'
+        run: |
+          python3 get_source.py --tags "${{ needs.resolve.outputs.aosp_tag }}" --jobs 8 --retries 3
+
+      - name: Stamp embedded build version string
+        env:
+          BT_VERSION: ${{ needs.resolve.outputs.build_tools_version }}
+        run: |
+          python3 - "$BT_VERSION" <<'PY'
+          import re, sys
+          from pathlib import Path
+          version = sys.argv[1]
+          header = Path("patches/misc/platform_tools_version.h")
+          targets = [header] + list(Path("src").rglob("platform_tools_version.h")) if Path("src").is_dir() else [header]
+          pattern = re.compile(r'^(\s*#define\s+PLATFORM_TOOLS_VERSION\s+)"[^"]*"', re.M)
+          for path in targets:
+              if not path.is_file():
+                  continue
+              text = path.read_text()
+              new, count = pattern.subn(r'\g<1>"%s"' % version, text)
+              if count and new != text:
+                  path.write_text(new)
+                  print("stamped %s -> %s" % (path, version))
+          text = header.read_text()
+          if '"%s"' % version not in text:
+              sys.exit("cannot stamp PLATFORM_TOOLS_VERSION in %s" % header)
+          print("build version string: %s" % version)
+          PY
+
+      - name: 'Preflight: source lists still cover this AOSP tag'
+        run: python3 scripts/check_aapt2_sources.py --src src
+
+      - name: Configure and build aapt2 + zipalign (host clang, static)
+        env:
+          CLANG_MAJOR: ${{ steps.clang.outputs.clang_major }}
+        run: |
+          # A silent log cannot tell a slow compile from a wedged one, so a
+          # background loop prints elapsed time, memory and build-dir size every
+          # 60s, and the EXIT trap stops it when the step ends either way.
+          (
+            while :; do
+              sleep 60
+              printf '[heartbeat %s] ' "$(date -u +%T)"
+              free -h | awk '/^Mem:/ {printf "mem %s/%s  ", $3, $2}'
+              if [ -d build ]; then
+                du -sh build 2>/dev/null | awk '{printf "build-dir %s  ", $1}'
+              fi
+              echo
+            done
+          ) &
+          heartbeat=$!
+          trap 'kill "$heartbeat" 2>/dev/null || true' EXIT
+
+          python3 build.py \
+            --cc "clang-${CLANG_MAJOR}" --cxx "clang++-${CLANG_MAJOR}" \
+            --target ${TOOLS} \
+            --build build --host-build host-tools \
+            --job "$(nproc)" --keep-going
+
+      - name: Collect artifacts and compute SHA-256
+        env:
+          FINGERPRINT: ${{ needs.detect.outputs.fingerprint }}
+          BT_VERSION: ${{ needs.resolve.outputs.build_tools_version }}
+          AOSP_TAG: ${{ needs.resolve.outputs.aosp_tag }}
+          API_LEVEL: ${{ needs.resolve.outputs.api_level }}
+          CLANG_MAJOR: ${{ steps.clang.outputs.clang_major }}
+        run: |
+          mkdir -p dist
+          # build-tools/CMakeLists.txt sets EXECUTABLE_OUTPUT_PATH to
+          # bin/${PROJECT_NAME}, and the project there is called build-tools, so
+          # the executables land one level deeper than the bin directory.
+          for tool in ${TOOLS}; do
+            src="build/bin/build-tools/${tool}"
+            if [ ! -f "$src" ]; then
+              echo "::error::$src was not built"
+              echo "build/bin holds:"
+              find build/bin -maxdepth 2 -type f 2>/dev/null | head -20
+              exit 1
+            fi
+            install -m 755 "$src" "dist/${tool}"
+          done
+          cd dist
+          sha256sum ${TOOLS} > SHA256SUMS
+          cat SHA256SUMS
+          {
+            echo "build-tools: ${BT_VERSION}"
+            echo "aosp-tag: ${AOSP_TAG}"
+            echo "aosp-api-level: ${API_LEVEL}"
+            echo "target: linux/${TARGET_ARCH} fully static (no PT_INTERP, no DT_NEEDED)"
+            echo "clang: $(clang-${CLANG_MAJOR} --version | head -1)"
+            echo "cmake: $(cmake --version | head -1)"
+            echo "ninja: $(ninja --version)"
+            echo "runner: $(uname -srm)"
+            echo "built-at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "source: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+            echo "fingerprint: ${FINGERPRINT}"
+            echo
+            echo "note: PLATFORM_TOOLS_VERSION in the AOSP sources is only the string embedded"
+            echo "      by libbuildversion; the artifact version is the build-tools version above."
+          } > BUILD-INFO.txt
+          cat BUILD-INFO.txt
+          # the four files travel as they are: the artifact download is already a
+          # zip archive, so wrapping them in a tar would only add a second layer.
+          # actions/upload-artifact drops the 755 bits, therefore every consumer
+          # restores them with chmod before running the tools.
+          ls -l
+
+      - name: Save source cache with fresh manifest
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.force_rebuild != true && github.event_name != 'pull_request'
+        run: |
+          mkdir -p cache-meta
+          python3 scripts/cache_manifest.py create --root src --manifest cache-meta/src.sha256
+          du -sh src host-tools
+
+      - name: Store source cache
+        if: steps.cache.outputs.cache-hit != 'true' && inputs.force_rebuild != true && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ needs.resolve.outputs.cache_key }}
+          path: |
+            src
+            cache-meta
+
+      - name: Store protoc cache
+        if: steps.protoc_cache.outputs.cache-hit != 'true' && inputs.force_rebuild != true && github.event_name != 'pull_request'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          key: ${{ steps.protoc_key.outputs.key }}
+          path: host-tools
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        name: Upload build artifact
+        with:
+          # the artifact name drives the filename of the downloaded archive, so the
+          # download is build-tools-<build-tools-version>-aarch64-linux-static.zip
+          # and it holds exactly aapt2, zipalign, SHA256SUMS and BUILD-INFO.txt
+          name: build-tools-${{ needs.resolve.outputs.build_tools_version }}-aarch64-linux-static
+          path: |
+            dist/aapt2
+            dist/zipalign
+            dist/SHA256SUMS
+            dist/BUILD-INFO.txt
+          if-no-files-found: error
+          retention-days: 14
+
+  # ------------------------------------------------------------------- verify
+  verify:
+    name: Verify static ELF and smoke tests
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        name: Check out the repository
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        name: Download build artifact
+        with:
+          name: build-tools-${{ needs.resolve.outputs.build_tools_version }}-aarch64-linux-static
+          path: dist
+
+      - name: Restore executable bits (artifact transfer drops mode)
+        working-directory: dist
+        run: |
+          chmod 0755 aapt2 zipalign
+          ls -l
+
+      - name: Re-verify checksums and executable bits
+        working-directory: dist
+        run: |
+          sha256sum --check --strict SHA256SUMS
+          for tool in aapt2 zipalign; do
+            test -x "$tool" \
+              || { echo "::error::$tool is not executable after unpacking"; exit 1; }
+          done
+
+      - name: Verify static AArch64 ELF with readelf
+        run: |
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends binutils
+          python3 scripts/verify_elf.py --expect-arch aarch64 --json elf-report.json \
+            dist/aapt2 dist/zipalign | tee verify.log
+          grep -q '^PASS .*aapt2' verify.log
+          grep -q '^PASS .*zipalign' verify.log
+
+      - name: Run functional smoke tests
+        run: |
+          python3 scripts/smoke_test.py \
+            --aapt2 dist/aapt2 --zipalign dist/zipalign \
+            --json smoke-report.json --workdir "$RUNNER_TEMP/smoke" | tee smoke.log
+
+      - name: Summary
+        run: |
+          {
+            echo "### verification"
+            echo ""
+            echo '```'
+            cat verify.log
+            echo
+            cat smoke.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        name: Upload verification reports
+        with:
+          name: verification-reports
+          path: |
+            elf-report.json
+            smoke-report.json
+            verify.log
+            smoke.log
+          retention-days: 14
+
+  # ------------------------------------------------------------------ release
+  release:
+    name: Publish release assets
+    needs: [resolve, build, verify]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    permissions:
+      contents: write # only this job may write; nothing else is granted
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        name: Check out the repository
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        name: Download build artifact
+        with:
+          name: build-tools-${{ needs.resolve.outputs.build_tools_version }}-aarch64-linux-static
+          path: dist
+
+      - name: Restore executable bits (artifact transfer drops mode)
+        working-directory: dist
+        run: |
+          chmod 0755 aapt2 zipalign
+          ls -l
+
+      - name: Re-verify checksums before publishing
+        working-directory: dist
+        run: sha256sum --check --strict SHA256SUMS
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BT_VERSION: ${{ needs.resolve.outputs.build_tools_version }}
+          AOSP_TAG: ${{ needs.resolve.outputs.aosp_tag }}
+          API_LEVEL: ${{ needs.resolve.outputs.api_level }}
+        run: |
+          set -euo pipefail
+          tag="build-tools-${BT_VERSION}-aarch64-linux-static"
+          echo "release tag: $tag"
+
+          # the release publishes the files loose so that each one can be fetched
+          # on its own; no archive is uploaded, and one left over from an earlier
+          # layout of this workflow is removed rather than carried along
+          ASSETS=(dist/aapt2 dist/zipalign dist/SHA256SUMS dist/BUILD-INFO.txt)
+          for f in "${ASSETS[@]}"; do
+            test -f "$f" || { echo "::error::$f is missing"; exit 1; }
+          done
+
+          # GitHub offers no way to set published_at directly; toggling draft
+          # republishes the release and stamps "now" without touching the body
+          republish_with_fresh_timestamp() {
+            local before after
+            before="$(gh release view "$tag" --json assets --jq '.assets | length')"
+            gh release edit "$tag" --draft=true
+            # a failed republish would leave the release hidden as a draft, so
+            # retry once and, if it still fails, say exactly how to undo it
+            if ! gh release edit "$tag" --draft=false; then
+              echo "::warning::republishing $tag failed, retrying once"
+              gh release edit "$tag" --draft=false || {
+                echo "::error::$tag is left as a draft and therefore hidden from the releases page."
+                echo "::error::restore it with: gh release edit $tag --draft=false"
+                exit 1
+              }
+            fi
+            after="$(gh release view "$tag" --json assets --jq '.assets | length')"
+            echo "republished $tag: assets $before -> $after, published $(gh release view "$tag" --json publishedAt --jq .publishedAt)"
+            [ "$before" = "$after" ] || {
+              echo "::error::the asset count changed across the draft round-trip"
+              exit 1
+            }
+          }
+
+          drop_stale_archives() {
+            gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null \
+              | while read -r name; do
+                  case "$name" in
+                    *.tar|*.tar.gz|*.tar.xz|*.zip)
+                      echo "removing stale archive asset: $name"
+                      gh release delete-asset "$tag" "$name" --yes ;;
+                  esac
+                done
+          }
+
+          # the notes are written once, before any branch, so the create path and both
+          # refresh paths describe exactly the same thing -- including the commit link
+          cat > notes.md <<EOF
+          Fully static AArch64 Linux **aapt2** and **zipalign**, built from AOSP sources.
+
+          | item | value |
+          | --- | --- |
+          | build-tools | \`${BT_VERSION}\` |
+          | AOSP source tag | \`${AOSP_TAG}\` |
+          | API level of the source tree | ${API_LEVEL} |
+          | target | \`linux/arm64\`, static (no \`PT_INTERP\`, no \`DT_NEEDED\`) |
+
+          Sources: https://github.com/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}
+
+          Every binary passed \`readelf\` based static-link verification and was executed on a
+          native AArch64 kernel (\`aapt2 version/compile/link\`, \`zipalign\` alignment checks)
+          before this release was created. Verify with \`sha256sum -c SHA256SUMS\`.
+          EOF
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            mkdir -p prev
+            gh release download "$tag" --pattern SHA256SUMS --dir prev --clobber
+            if [ -f prev/SHA256SUMS ] && diff -q prev/SHA256SUMS dist/SHA256SUMS >/dev/null; then
+              echo "::notice::release $tag already carries identical binaries, nothing to upload"
+              # the body must stay as it is, only the publish timestamp has to
+              # follow this build. GitHub exposes no field for that, but a draft
+              # round-trip republishes the release and stamps the current time
+              # while keeping the tag, the notes and every asset
+              republish_with_fresh_timestamp
+              exit 0
+            fi
+            # The bytes differ from what is published. That is expected, not an
+            # error: the build job only runs when the detect gate saw an input
+            # change, and a newer clang or cmake legitimately produces different
+            # bytes for the same build-tools version. Replace the assets and keep
+            # both checksum sets in the log so the change stays auditable.
+            echo "::notice::binaries differ from the published ones, replacing the assets of $tag"
+            echo "--- published ---"
+            cat prev/SHA256SUMS 2>/dev/null || echo "(the release carries no SHA256SUMS)"
+            echo "--- this build ---"
+            cat dist/SHA256SUMS
+            drop_stale_archives
+            gh release upload "$tag" "${ASSETS[@]}" --clobber
+            # the assets were replaced, so the release date has to move with them
+            republish_with_fresh_timestamp
+          else
+            gh release create "$tag" "${ASSETS[@]}" --target "$GITHUB_SHA" \
+              --title "build-tools ${BT_VERSION} (aarch64 static)" --notes-file notes.md
+          fi
+
+          # independent confirmation that the assets really landed
+          count="$(gh release view "$tag" --json assets --jq '.assets | length')"
+          echo "assets in release: $count"
+          for asset in "${ASSETS[@]##*/}"; do
+            gh release view "$tag" --json assets --jq '.assets[].name' | grep -qx "$asset" \
+              || { echo "::error::asset $asset is missing from $tag"; exit 1; }
+          done
+          # the files are published loose; an archive would just duplicate them
+          if gh release view "$tag" --json assets --jq '.assets[].name' | grep -qE '\.tar(\.gz)?$'; then
+            echo "::error::release $tag still carries an archive asset"
+            exit 1
+          fi
+          mkdir -p final
+          gh release download "$tag" --pattern SHA256SUMS --dir final --clobber
+          diff -u dist/SHA256SUMS final/SHA256SUMS
+          echo "::notice::published $tag"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### release"
+            echo ""
+            echo "- tag: \`build-tools-${{ needs.resolve.outputs.build_tools_version }}-aarch64-linux-static\`"
+            echo "- aosp tag: \`${{ needs.resolve.outputs.aosp_tag }}\`"
+            echo "- force_rebuild: \`${{ inputs.force_rebuild }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

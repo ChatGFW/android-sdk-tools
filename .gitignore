@@ -1,0 +1,23 @@
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+build
+pack
+src
+host-tools
+
+# 太墟本地续跑档：只在本地保留，不进仓库、不进发布包
+PROGRESS.md
+HOOKPOINTS.md
+
+# 太墟沙箱的项目标记，不属于仓库内容
+.taixu-project.properties
+.taixu-outputs/
+__pycache__/
+*.pyc
