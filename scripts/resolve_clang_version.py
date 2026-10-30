@@ -41,13 +41,28 @@ def log(msg):
     print(msg, file=sys.stderr)
 
 
+def _request_headers(user_agent):
+    """Headers for every outbound request.
+
+    Only the cross-check against the LLVM release feed touches api.github.com, but
+    that one call is enough to fail: anonymous callers get 60 requests per hour
+    counted per IP, and Actions runners share their egress address with unrelated
+    jobs.  A token raises the budget to 5000 per hour against the token itself.
+    """
+    headers = {
+        'User-Agent': user_agent,
+        'Accept-Encoding': 'identity',
+    }
+    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    return headers
+
+
 def fetch(url, timeout=45, binary=False):
     # apt.llvm.org sits behind a CDN that compresses whether or not the client
     # asked for it, so ask for identity and still cope with a gzip response.
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'taixu-resolve-clang/1.0',
-        'Accept-Encoding': 'identity',
-    })
+    req = urllib.request.Request(url, headers=_request_headers('taixu-resolve-clang/1.0'))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read()
         if (resp.headers.get('Content-Encoding') or '').lower() == 'gzip':

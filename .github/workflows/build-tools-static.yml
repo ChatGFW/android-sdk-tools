@@ -151,11 +151,15 @@ jobs:
 
       - name: Resolve clang version (apt.llvm.org, no install)
         id: clang
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 scripts/resolve_clang_version.py --github-output "$GITHUB_OUTPUT"
 
       - name: Resolve cmake version (Kitware, no download)
         id: cmake
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 scripts/resolve_cmake_version.py --check-only --github-output "$GITHUB_OUTPUT"
 
@@ -235,6 +239,8 @@ jobs:
 
       - name: Resolve clang version (apt.llvm.org)
         id: clang
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 scripts/resolve_clang_version.py --github-output "$GITHUB_OUTPUT"
 
@@ -297,6 +303,8 @@ jobs:
 
       - name: Install cmake from Kitware
         id: cmake
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           python3 scripts/resolve_cmake_version.py \
             --dest "$RUNNER_TEMP/cmake" --github-output "$GITHUB_OUTPUT"

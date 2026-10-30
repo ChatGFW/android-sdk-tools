@@ -34,11 +34,28 @@ def log(msg):
     print(msg, file=sys.stderr)
 
 
-def fetch(url, timeout=120):
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'taixu-resolve-cmake/1.0',
+def _request_headers(user_agent):
+    """Headers for every outbound request.
+
+    api.github.com allows 60 requests per hour for anonymous callers, counted per
+    IP address.  Actions runners share their egress address with unrelated jobs,
+    so that budget is routinely spent before this script asks for anything, which
+    is exactly how a scheduled run died with "HTTP Error 403: rate limit
+    exceeded".  Presenting a token raises the budget to 5000 per hour and makes it
+    count against the token instead of the shared address.
+    """
+    headers = {
+        'User-Agent': user_agent,
         'Accept-Encoding': 'identity',
-    })
+    }
+    token = os.environ.get('GH_TOKEN') or os.environ.get('GITHUB_TOKEN')
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    return headers
+
+
+def fetch(url, timeout=120):
+    req = urllib.request.Request(url, headers=_request_headers('taixu-resolve-cmake/1.0'))
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         body = resp.read()
         if (resp.headers.get('Content-Encoding') or '').lower() == 'gzip':
@@ -49,10 +66,7 @@ def fetch(url, timeout=120):
 def download(url, path, timeout=900):
     # the payload is already a tar.gz; transport-level compression would only
     # corrupt it, so ask for identity and never decompress here
-    req = urllib.request.Request(url, headers={
-        'User-Agent': 'taixu-resolve-cmake/1.0',
-        'Accept-Encoding': 'identity',
-    })
+    req = urllib.request.Request(url, headers=_request_headers('taixu-resolve-cmake/1.0'))
     digest = hashlib.sha256()
     size = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp, open(path, 'wb') as out:
