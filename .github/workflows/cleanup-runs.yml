@@ -1,0 +1,144 @@
+# Deletes old workflow run records (their logs and artifacts go with them) and stale
+# Actions caches. Only finished runs are deleted; queued or running ones, including this
+# run, are never touched. Releases and tags are not affected.
+name: Cleanup workflow runs
+
+on:
+  # Every third day, matched to the three-day retention below. Running daily would wake a
+  # runner to find almost nothing past its expiry, since nothing can age out faster than the
+  # window it is measured against. The day-of-month step means the sequence resets at each
+  # month boundary, so the gap across a short month can be one or two days rather than three;
+  # retention is only ever approximate anyway, and every run catches up whatever accumulated.
+  # The push trigger is a second, always-available path for repositories whose schedule never
+  # fires, and the concurrency group keeps the two from overlapping.
+  #
+  # The time is planted early on purpose. GitHub's scheduler dispatches this workflow late,
+  # and the delay is not queueing: created_at and run_started_at come back identical to the
+  # second, so the jobs were never waiting for a runner. The one run we measured started
+  # 7h16m after its cron time (cron 03:20 UTC, dispatched 10:36 UTC). Asking for 03:50 UTC
+  # directly would therefore land around 11:06 Asia/Shanghai, so the cron says 20:34 UTC on
+  # the previous day instead, which the same observed delay brings back to 03:50 UTC.
+  # The delay varies by a little over an hour between runs, so treat 11:50 as the centre of
+  # a window rather than a fixed minute, and re-derive this if it drifts.
+  schedule:
+    - cron: '34 20 */3 * *'   # 20:34 UTC every third day = 04:34 Asia/Shanghai next day;
+                              # observed dispatch delay of 7h16m lands it near 11:50
+  push:
+    branches: [master]
+  workflow_dispatch:       # Run it by hand from the Actions tab, optionally as a dry run
+    inputs:
+      keep_days:
+        description: 'Keep runs and caches newer than this many days (0 = delete everything eligible)'
+        required: false
+        default: '3'
+      dry_run:
+        description: 'Only list what would be deleted'
+        type: boolean
+        required: false
+        default: false
+
+# Deleting workflow runs and caches needs the actions scope; nothing else is required
+permissions:
+  actions: write
+
+# Never run two cleanups at once
+concurrency:
+  group: cleanup-runs
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-26.04
+    env:
+      GH_TOKEN: ${{ github.token }}                 # Auth for the gh CLI
+      KEEP_DAYS: ${{ inputs.keep_days || '3' }}    # Scheduled runs have no inputs: keep three days
+      DRY_RUN: ${{ inputs.dry_run || 'false' }}
+    steps:
+      - name: Delete finished workflow runs
+        run: |
+          set -euo pipefail
+
+          if ! [[ "$KEEP_DAYS" =~ ^[0-9]+$ ]]; then
+            echo "keep_days must be a non-negative integer, got '$KEEP_DAYS'" >&2
+            exit 1
+          fi
+
+          # Runs created before this moment are deleted (ISO 8601 strings compare correctly as text)
+          CUTOFF=$(date -u -d "$KEEP_DAYS days ago" +%Y-%m-%dT%H:%M:%SZ)
+          echo "Deleting finished runs created before $CUTOFF (keep_days=$KEEP_DAYS, dry_run=$DRY_RUN)"
+
+          # List every run of the repository. The query deliberately has no status filter:
+          # the API caps filtered searches at 1000 results, a plain listing is paginated fully.
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs?per_page=100" \
+                  --jq ".workflow_runs[] | select(.status == \"completed\" and .created_at < \"$CUTOFF\") | .id")
+
+          if [ -z "$ids" ]; then
+            echo "Nothing to delete"
+            exit 0
+          fi
+          echo "Found $(printf '%s\n' "$ids" | wc -l) run(s) to delete"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run, these run ids would be deleted:"
+            printf '%s\n' "$ids"
+            exit 0
+          fi
+
+          deleted=0
+          failed=0
+          for id in $ids; do
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/runs/$id" --silent 2>/dev/null; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+              echo "Could not delete run $id" >&2
+            fi
+          done
+
+          echo "Deleted $deleted run(s), $failed failed"
+          # Fail the job only if something went wrong, so the problem shows up in the Actions list
+          [ "$failed" -eq 0 ]
+
+      - name: Delete unused Actions caches
+        run: |
+          set -euo pipefail
+
+          # Caches are aged by last use, not by creation: a warm cache that every build reads
+          # is exactly what we want to keep, however old it is. A cache nothing has touched
+          # for the whole window is dead weight against the repository quota.
+          # last_accessed_at comes back with nanosecond precision ("...T10:00:00.000000000Z").
+          # Matching that shape keeps the comparison a plain string compare of like with like,
+          # instead of relying on '.' sorting before 'Z' to break a same-second tie correctly.
+          CUTOFF=$(date -u -d "$KEEP_DAYS days ago" +%Y-%m-%dT%H:%M:%S).000000000Z
+          echo "Deleting caches last used before $CUTOFF (keep_days=$KEEP_DAYS, dry_run=$DRY_RUN)"
+
+          # Same reasoning as above for dropping the query filter: paginate the plain listing
+          # and filter locally, so a repository with many caches is not silently truncated.
+          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/caches?per_page=100" \
+                  --jq ".actions_caches[] | select(.last_accessed_at < \"$CUTOFF\") | .id")
+
+          if [ -z "$ids" ]; then
+            echo "Nothing to delete"
+            exit 0
+          fi
+          echo "Found $(printf '%s\n' "$ids" | wc -l) cache(s) to delete"
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run, these cache ids would be deleted:"
+            printf '%s\n' "$ids"
+            exit 0
+          fi
+
+          deleted=0
+          failed=0
+          for id in $ids; do
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/actions/caches/$id" --silent 2>/dev/null; then
+              deleted=$((deleted + 1))
+            else
+              failed=$((failed + 1))
+              echo "Could not delete cache $id" >&2
+            fi
+          done
+
+          echo "Deleted $deleted cache(s), $failed failed"
+          [ "$failed" -eq 0 ]

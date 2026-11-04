@@ -1,0 +1,36 @@
+--- a/base/libs/androidfw/LoadedArsc.cpp
++++ b/base/libs/androidfw/LoadedArsc.cpp
+@@ -273,14 +273,26 @@
+     bool error = false;
+     auto sparse_indices = offsets.convert<ResTable_sparseTypeEntry>().iterator();
+     auto sparse_indices_end = sparse_indices + entry_count;
+-    auto result = std::lower_bound(sparse_indices, sparse_indices_end, entry_index,
+-                                   [&error](const incfs::map_ptr<ResTable_sparseTypeEntry>& entry,
+-                                            uint16_t entry_idx) {
+-      if (UNLIKELY(!entry)) {
+-        return error = true;
++    // libstdc++ implements std::lower_bound through std::__advance, whose bidirectional
++    // overload instantiates a decrement even for a positive distance; incfs::map_ptr's
++    // iterator has no operator-- (libc++ never needs one), so the same loop is spelled out
++    // here with plain offset arithmetic.
++    size_t begin = 0;
++    size_t len = entry_count;
++    while (len > 0) {
++      const size_t half = len >> 1;
++      const size_t middle = begin + half;
++      const incfs::map_ptr<ResTable_sparseTypeEntry> entry = *(sparse_indices + middle);
++      // match the original comparator: an unreadable page sets error and counts as "less"
++      const bool entry_less = !entry ? (error = true) : (dtohs(entry->idx) < entry_index);
++      if (entry_less) {
++        begin = middle + 1;
++        len = len - half - 1;
++      } else {
++        len = half;
+       }
+-      return dtohs(entry->idx) < entry_idx;
+-    });
++    }
++    auto result = sparse_indices + begin;
+ 
+     if (result == sparse_indices_end) {
+       // No entry found.
