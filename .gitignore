@@ -1,0 +1,18 @@
+# Build output of this project's own CMake flow.
+CMakeCache.txt
+CMakeFiles
+CMakeScripts
+Testing
+Makefile
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+build
+# get_source.py checks the AOSP trees out here; they are gigabytes and re-fetchable.
+src
+host-tools
+
+# Python bytecode from the helper scripts.
+__pycache__/
+*.pyc

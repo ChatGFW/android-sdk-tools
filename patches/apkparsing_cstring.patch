@@ -1,0 +1,10 @@
+--- a/src/base/libs/androidfw/ApkParsing.cpp
++++ b/src/base/libs/androidfw/ApkParsing.cpp
+@@ -17,6 +17,7 @@
+ #include "androidfw/ApkParsing.h"
+ #include <algorithm>
+ #include <array>
++#include <cstring>
+ #include <stdlib.h>
+ #include <string_view>
+ #include <sys/types.h>
